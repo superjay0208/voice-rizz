@@ -77,7 +77,7 @@ DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-reasoner")
 DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
 
 # Session controls
-IDLE_TIMEOUT_SEC = int(os.environ.get("IDLE_TIMEOUT_SEC", "180"))  # finalize if idle this long
+IDLE_TIMEOUT_SEC = int(os.environ.get("IDLE_TIMEOUT_SEC", "30"))  # finalize if idle this long
 
 # NOTE: MAX_CHUNK_SEC is no longer relevant as we are not streaming to Hume
 # MAX_CHUNK_SEC = float(os.environ.get("MAX_CHUNK_SEC", "4.8"))
