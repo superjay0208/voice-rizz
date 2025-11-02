@@ -461,13 +461,13 @@ def _bytes_to_wav_path(raw: bytes, sample_rate: int) -> str:
         wf.writeframes(raw)
     return tmp_path
 
-def _build_stream_config() -> Any: # Returns the config object itself
+def _build_stream_config() -> Any:
     """Build Hume stream 'config' object in a version-resilient way."""
     if EMConfig is not None:
         return EMConfig(prosody={})  # Return the object directly
     if HumeStreamDataModels is not None:
         return HumeStreamDataModels(prosody={})  # Return the object directly
-    return {"prosody": {}}  # Fallback to a plain dict as the config
+    return {"prosody": {}}  # Fallback to a plain dict
 
 async def hume_measure_bytes(audio_bytes: bytes, sample_rate: int) -> Optional[Dict[str, Any]]:
     """Use Hume Expression Measurement (Prosody) stream for a short chunk."""
@@ -475,14 +475,15 @@ async def hume_measure_bytes(audio_bytes: bytes, sample_rate: int) -> Optional[D
         print("❌ Hume client not configured")
         return None
     
-    # 1. Get the config object directly
+    # 1. Get the config object from the fixed helper
     stream_config = _build_stream_config() 
     
     wav_path = _bytes_to_wav_path(audio_bytes, sample_rate)
     try:
-        # 2. Pass the config object as the FIRST POSITIONAL ARGUMENT
-        async with hume_client.expression_measurement.stream.connect(stream_config) as socket:
-            result = await socket.send_file(wav_path)
+        # 2. Call connect() with NO arguments
+        async with hume_client.expression_measurement.stream.connect() as socket:
+            # 3. Pass the config to send_file() instead
+            result = await socket.send_file(wav_path, config=stream_config)
             return result
     except Exception as e:
         print(f"❌ Hume stream error: {e}")
@@ -545,13 +546,13 @@ async def hume_ping():
     if not hume_client:
         return {"ok": False, "error": "Hume not configured"}
     try:
-        options = _build_stream_options()
-        async with hume_client.expression_measurement.stream.connect(options=options):
+        # Call connect() with NO arguments
+        async with hume_client.expression_measurement.stream.connect():
             pass
         return {"ok": True}
     except Exception as e:
         return {"ok": False, "error": str(e)}
-
+        
 @app.get("/llm/ping")
 async def llm_ping():
     msgs = [{"role": "system", "content": "Return ONLY: ok"}, {"role": "user", "content": "ok"}]
