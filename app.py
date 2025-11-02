@@ -327,13 +327,16 @@ class EmotionAgg:
 
     # --- FIX 2: UPDATE THIS FUNCTION TO HANDLE ERRORS ---
     def add_predictions(self, result: Any, slice_dur: float, t0: float):
-        # Check if 'result' is an error or not a dict-like object
-        if not hasattr(result, "get"):
-            if StreamErrorMessage and isinstance(result, StreamErrorMessage):
-                print(f"❌ Aggregator received Hume error: {result.error}")
-            else:
-                print(f"❌ Aggregator received invalid result type: {type(result)}")
+        # --- FIX: Check for an error attribute FIRST ---
+        if hasattr(result, "error"):
+            print(f"❌ Aggregator received Hume error: {getattr(result, 'error', 'Unknown Error')}")
             return # Stop processing this chunk
+
+        # Check if it's a valid dict-like object
+        if not hasattr(result, "get"):
+            print(f"❌ Aggregator received invalid/unknown result type: {type(result)}")
+            return # Stop processing this chunk
+        # --- END FIX ---
 
         prosody = result.get("prosody") or result.get("models", {}).get("prosody")
         if not prosody:
