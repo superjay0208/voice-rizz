@@ -1,4 +1,4 @@
-hume>=0.13,<0.14
+hume==0.13.1
 fastapi>=0.115
 uvicorn[standard]>=0.30
 httpx>=0.27
