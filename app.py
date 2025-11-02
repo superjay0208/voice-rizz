@@ -461,23 +461,27 @@ def _bytes_to_wav_path(raw: bytes, sample_rate: int) -> str:
         wf.writeframes(raw)
     return tmp_path
 
-def _build_stream_options() -> Dict[str, Any]:
-    """Build Hume stream 'options' in a version-resilient way."""
+def _build_stream_config() -> Any: # Returns the config object itself
+    """Build Hume stream 'config' object in a version-resilient way."""
     if EMConfig is not None:
-        return {"config": EMConfig(prosody={})}
+        return EMConfig(prosody={})  # Return the object directly
     if HumeStreamDataModels is not None:
-        return {"config": HumeStreamDataModels(prosody={})}
-    return {"config": {"prosody": {}}}
+        return HumeStreamDataModels(prosody={})  # Return the object directly
+    return {"prosody": {}}  # Fallback to a plain dict as the config
 
 async def hume_measure_bytes(audio_bytes: bytes, sample_rate: int) -> Optional[Dict[str, Any]]:
     """Use Hume Expression Measurement (Prosody) stream for a short chunk."""
     if not hume_client:
         print("❌ Hume client not configured")
         return None
-    options = _build_stream_options()
+    
+    # 1. Get the config object directly
+    stream_config = _build_stream_config() 
+    
     wav_path = _bytes_to_wav_path(audio_bytes, sample_rate)
     try:
-        async with hume_client.expression_measurement.stream.connect(options=options) as socket:
+        # 2. Pass the config object as the FIRST POSITIONAL ARGUMENT
+        async with hume_client.expression_measurement.stream.connect(stream_config) as socket:
             result = await socket.send_file(wav_path)
             return result
     except Exception as e:
@@ -488,7 +492,6 @@ async def hume_measure_bytes(audio_bytes: bytes, sample_rate: int) -> Optional[D
             os.remove(wav_path)
         except Exception:
             pass
-
 # =========================
 # Finalization: Build report (LLM first, deterministic fallback)
 # =========================
