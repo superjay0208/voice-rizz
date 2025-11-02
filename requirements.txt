@@ -1,6 +1,6 @@
-fastapi>=0.111,<0.117
-uvicorn[standard]>=0.30,<0.31
-httpx>=0.27,<0.28
-pydantic>=2.7,<3.0
-hume[stream]>=0.7,<1.0
-python-dotenv>=1.0,<2.0
+hume>=0.13,<0.14
+fastapi>=0.115
+uvicorn[standard]>=0.30
+httpx>=0.27
+pydantic>=2.8
+python-dotenv>=1.0  # optional, if you use .env locally
