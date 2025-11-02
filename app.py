@@ -534,44 +534,100 @@ def _build_stream_config() -> Any:
     return {"prosody": {}}  # Fallback to a plain dict
 
 async def hume_measure_batch(audio_bytes: bytes, sample_rate: int) -> Optional[List[Dict[str, Any]]]:
-    """Use Hume Expression Measurement (Batch) for a full audio file."""
-    if not hume_client:
-        print("❌ Hume client (batch) not configured")
+    """
+    Call Hume Expression Measurement (Batch) via REST.
+    Returns the JSON predictions list (same shape you expected), or None on failure.
+    """
+    if not (HUME_API_KEY and http_client):
+        print("❌ Hume REST: missing API key or HTTP client")
         return None
-    
-    batch_config = _build_stream_config() 
+
+    # 1) Write a WAV temp from raw PCM16 (mono)
     wav_path = _bytes_to_wav_path(audio_bytes, sample_rate)
-    job = None
+
+    headers = {
+        "X-Hume-Api-Key": HUME_API_KEY,
+        # NOTE: httpx sets multipart boundary/Content-Type automatically when using files=...
+    }
+    # Prosody-only job
+    models = {"models": {"prosody": {}}}
+
+    # 2) Start job (multipart: json + file)
+    job_id = None
+    f = None
     try:
-        print(f"Hume Batch: Submitting file {wav_path} ({len(audio_bytes) / (sample_rate * 2):.2f}s)")
-        # NOTE: submit_file is a method on the BatchClient, not stream
-        job = await hume_client.expression_measurement.batch.submit_file(wav_path, config=batch_config)
-        print(f"Hume Batch: Job {job.id} submitted. Awaiting completion (this may take a moment)...")
-        
-        # Wait for the job to complete
-        await job.await_complete(timeout=600.0) # 10-minute timeout
-        
-        print(f"Hume Batch: Job {job.id} completed.")
-        
-        preds = await job.get_predictions()
-        if not preds:
-            print(f"❌ Hume Batch: Job {job.id} returned no predictions.")
+        f = open(wav_path, "rb")
+        files = {
+            "json": (None, json.dumps(models), "application/json"),
+            "file": (os.path.basename(wav_path), f, "audio/wav"),
+        }
+        resp = await http_client.post(
+            "https://api.hume.ai/v0/batch/jobs",
+            headers=headers,
+            files=files,
+            timeout=60.0,
+        )
+        if resp.status_code // 100 != 2:
+            print(f"❌ Hume REST: job submit failed {resp.status_code} {resp.text[:400]}")
             return None
-        return preds
+        job_id = resp.json().get("job_id")
+        if not job_id:
+            print(f"❌ Hume REST: job_id missing in response: {resp.text[:300]}")
+            return None
     except Exception as e:
-        print(f"❌ Hume Batch error: {e}")
-        if job:
-            try:
-                details = await job.get_details()
-                print(f"Job details: {details}")
-            except Exception as de:
-                print(f"Failed to get job details: {de}")
+        print(f"❌ Hume REST: submit error: {e}")
         return None
     finally:
         try:
+            if f: f.close()
             os.remove(wav_path)
         except Exception:
             pass
+
+    # 3) Poll job status with backoff (recommend webhooks for prod)
+    status = "PENDING"
+    started = time.time()
+    delay = 1.0
+    while True:
+        try:
+            detail = await http_client.get(
+                f"https://api.hume.ai/v0/batch/jobs/{job_id}",
+                headers=headers,
+                timeout=20.0,
+            )
+            if detail.status_code // 100 != 2:
+                print(f"⚠️ Hume REST: status {detail.status_code} {detail.text[:200]}")
+            else:
+                j = detail.json()
+                status = (j.get("state") or {}).get("status", status)
+                if status == "COMPLETED":
+                    break
+                if status == "FAILED":
+                    print(f"❌ Hume REST: job {job_id} failed.")
+                    return None
+        except Exception as e:
+            print(f"⚠️ Hume REST: poll error {e}")
+
+        if time.time() - started > 600:  # 10 min hard timeout
+            print(f"❌ Hume REST: job {job_id} timed out.")
+            return None
+        await asyncio.sleep(delay)
+        delay = min(delay * 1.5, 6.0)
+
+    # 4) Fetch predictions JSON
+    try:
+        preds = await http_client.get(
+            f"https://api.hume.ai/v0/batch/jobs/{job_id}/predictions",
+            headers=headers,
+            timeout=60.0,
+        )
+        if preds.status_code // 100 != 2:
+            print(f"❌ Hume REST: predictions fetch failed {preds.status_code} {preds.text[:400]}")
+            return None
+        return preds.json()
+    except Exception as e:
+        print(f"❌ Hume REST: predictions error {e}")
+        return None
 
 # =========================
 # Finalization: Build report
