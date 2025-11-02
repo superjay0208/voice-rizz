@@ -1,6 +1,6 @@
-hume==0.13.1
+hume[stream]==0.13.1
+httpx>=0.27
 fastapi>=0.115
 uvicorn[standard]>=0.30
-httpx>=0.27
 pydantic>=2.8
 python-dotenv>=1.0  # optional, if you use .env locally
