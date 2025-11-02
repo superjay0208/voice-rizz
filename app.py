@@ -1,14 +1,16 @@
 # --------------------------------------------------------------------
-# Vocal Tone (Hume Batch) -> LLM Report (DeepSeek) -> Push to Omi
-# Buffers audio and uses Hume BATCH REST at the end of a session.
+# Vocal Tone (Hume STREAM, 4s chunks) -> LLM Report (DeepSeek) -> Push to Omi
+# For each POST /audio, forward the whole (≈4s) chunk to Hume stream.
 #
 # Run (Render Start Command):
 #   uvicorn app:app --host 0.0.0.0 --port $PORT
-# Omi sender:
-#   POST raw audio bytes to /audio?uid=...&sample_rate=16000&codec=pcm16
+# Client (Omi):
+#   POST raw audio to /audio?uid=...&sample_rate=16000&codec=pcm16  (≈4s per request)
+#   POST /conversation/end?uid=...  to finalize
 # --------------------------------------------------------------------
 
 import os
+import io
 import re
 import wave
 import json
@@ -22,23 +24,16 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI, Request, Query
 
-# ---------------- Optional Hume SDK (for /hume/ping only) ----------------
+# ---- Hume streaming SDK (pip install "hume[stream]") -------------------------
 try:
-    from hume.client import AsyncHumeClient  # recent SDKs
-except Exception:
-    try:
-        from hume import AsyncHumeClient      # some versions re-export
-    except Exception:
-        AsyncHumeClient = None  # type: ignore
-try:
+    from hume.client import AsyncHumeClient
     from hume.expression_measurement.stream import Config as EMConfig
+    from hume.expression_measurement.stream.socket_client import StreamConnectOptions
 except Exception:
+    AsyncHumeClient = None
     EMConfig = None
-try:
-    from hume import StreamDataModels as HumeStreamDataModels  # type: ignore
-except Exception:
-    HumeStreamDataModels = None
-# -------------------------------------------------------------------------
+    StreamConnectOptions = None
+# -----------------------------------------------------------------------------
 
 PID = os.getpid()
 
@@ -46,7 +41,7 @@ PID = os.getpid()
 # Env / constants
 # =========================
 OMI_APP_ID = os.environ.get("OMI_APP_ID")
-OMI_APP_SECRET = os.environ.get("OMI_APP_SECRET")  # USED FOR ALL OMI ENDPOINTS
+OMI_APP_SECRET = os.environ.get("OMI_APP_SECRET")  # used for ALL Omi endpoints
 
 HUME_API_KEY = os.environ.get("HUME_API_KEY")
 
@@ -55,26 +50,18 @@ DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-reasoner")
 DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
 
 IDLE_TIMEOUT_SEC = int(os.environ.get("IDLE_TIMEOUT_SEC", "30"))
-
-START_RE = re.compile(r"\bconversation\s*starts\b", re.I)
-END_RE   = re.compile(r"\bconversa(?:i?t)ion\s*end(?:s)?\b", re.I)
+SUPPORTED_CODECS = {"pcm16", "pcm8"}  # Opus not handled here
 
 # =========================
 # App & clients
 # =========================
 http_client: Optional[httpx.AsyncClient] = None
-hume_client: Optional[Any] = None  # only for /hume/ping
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global http_client, hume_client
-    print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🚀 Hume Vocal Tone server (BATCH MODE) starting...")
+    global http_client
+    print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🚀 Hume Vocal Tone server (STREAM MODE, 4s) starting...")
     http_client = httpx.AsyncClient(timeout=45.0)
-    if AsyncHumeClient and HUME_API_KEY:
-        try:
-            hume_client = AsyncHumeClient(api_key=HUME_API_KEY)
-        except Exception:
-            hume_client = None
     try:
         yield
     finally:
@@ -82,7 +69,7 @@ async def lifespan(app: FastAPI):
             await http_client.aclose()
         print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 👋 Server shutting down...")
 
-app = FastAPI(title="Vocal Tone (Hume Batch x Omi x DeepSeek)", lifespan=lifespan)
+app = FastAPI(title="Vocal Tone (Hume Stream 4s x Omi x DeepSeek)", lifespan=lifespan)
 
 # =========================
 # Omi helpers (use OMI_APP_SECRET for ALL endpoints)
@@ -176,9 +163,9 @@ async def call_llm(messages: List[Dict[str, str]], temperature=0.2, max_tokens=1
 # Hume Analysis Prompt (voice-only)
 # =========================
 HUME_ANALYSIS_SYSTEM_PROMPT = """You are an expert vocal and emotional analyst.
-Your job is to read a JSON object containing vocal prosody and emotion data from Hume AI
-(“Expression Measurement / Prosody”) and return a single, formatted, plain-text "Vocal Tone Report".
-[...trimmed for brevity — keep your full prompt here...]
+Return a concise plain-text "Vocal Tone Report" from Hume Prosody JSON.
+Include Overall score, AI Confidence, short highlights, 2 tips, and a breakdown.
+Keep it scannable with bullets. Avoid hedging language. Keep under ~2200 chars.
 """
 
 def build_hume_user_prompt(hume_json: dict, title_hint: Optional[str] = None) -> str:
@@ -191,75 +178,43 @@ Hume Prosody JSON:
 """
 
 # =========================
-# Batch Result Processor
+# Real-time aggregator
 # =========================
-class BatchResultProcessor:
-    def __init__(self, batch_result_json: List[Dict[str, Any]]):
+class RealtimeAgg:
+    def __init__(self):
         self.total_dur = 0.0
-        self.predictions: List[Dict[str, Any]] = []
         self.emotion_sum: Dict[str, float] = {}
         self.peak_events: List[Tuple[float, str, float]] = []
+
+    def ingest(self, result: Dict[str, Any]):
         try:
-            self._parse_batch_json(batch_result_json)
+            models = (result.get("models") or {})
+            prosody = models.get("prosody") or {}
+            preds = prosody.get("predictions") or []
+            for p in preds:
+                t = p.get("time") or {}
+                begin = float(t.get("begin", 0.0)); end_v = float(t.get("end", begin))
+                self.total_dur = max(self.total_dur, end_v)
+                for e in (p.get("emotions") or []):
+                    name = str(e.get("name", "unknown")).strip()
+                    score = float(e.get("score", 0.0))
+                    self.emotion_sum[name] = self.emotion_sum.get(name, 0.0) + score
+                    if score >= 0.75:
+                        self.peak_events.append((begin, name, score))
         except Exception as e:
-            print(f"❌ BatchResultProcessor parse error: {e}")
-            print(f"Data preview: {json.dumps(batch_result_json, indent=2)[:1000]}")
+            print(f"⚠️ RealtimeAgg ingest error: {e}. Result preview: {json.dumps(result)[:500]}")
 
-    def _parse_batch_json(self, batch_result_json: List[Dict[str, Any]]):
-        if not batch_result_json:
-            print("❌ BatchResultProcessor: JSON empty."); return
-        file_result = batch_result_json[0]
-        res = file_result.get("results", {})
-        pred_sets = (res.get("predictions") or [])
-        if not pred_sets:
-            print("❌ BatchResultProcessor: results.predictions missing/empty."); return
-        first_prediction_set = pred_sets[0]
-        models = first_prediction_set.get("models", {})
-        if "prosody" not in models:
-            print("❌ BatchResultProcessor: models.prosody missing."); return
-
-        prosody = models["prosody"]
-
-        # Prefer flat predictions, else flatten grouped_predictions
-        all_preds = prosody.get("predictions")
-        if not all_preds:
-            flat: List[Dict[str, Any]] = []
-            for g in prosody.get("grouped_predictions", []):
-                gid = g.get("id") or g.get("speaker")
-                for p in g.get("predictions", []):
-                    q = dict(p)
-                    q["speaker"] = q.get("speaker") or gid
-                    flat.append(q)
-            all_preds = flat
-
-        if not all_preds:
-            print("BatchResultProcessor: Prosody model ran but found no predictions."); return
-
-        self.total_dur = max(float(p.get("time", {}).get("end", 0.0)) for p in all_preds if p.get("time"))
-
-        for p in all_preds:
-            t = p.get("time", {}) or {}
-            begin = float(t.get("begin", 0.0)); end_v = float(t.get("end", begin))
-            emotions = p.get("emotions", []) or []
-            for e in emotions:
-                name = str(e.get("name", "unknown")).strip()
-                score = float(e.get("score", 0.0))
-                self.emotion_sum[name] = self.emotion_sum.get(name, 0.0) + score
-                if score >= 0.75:
-                    self.peak_events.append((begin, name, score))
-            self.predictions.append({
-                "time": {"begin": begin, "end": end_v},
-                "emotions": [{"name": e.get("name"), "score": float(e.get("score", 0.0))} for e in emotions],
-                "speaker": p.get("speaker") or p.get("person") or None
-            })
-
-    def compressed_json(self, topk_per_pred=5, min_score=0.15, max_preds=600) -> Dict[str, Any]:
-        preds_out = []
-        for p in self.predictions[:max_preds]:
-            emos = [e for e in p.get("emotions", []) if float(e.get("score", 0.0)) >= min_score]
-            emos = sorted(emos, key=lambda x: float(x.get("score", 0.0)), reverse=True)[:topk_per_pred]
-            preds_out.append({"speaker": p.get("speaker"), "time": p.get("time"), "emotions": emos})
-        return {"meta": {"audio_duration_sec": self.total_dur}, "prosody": {"predictions": preds_out}}
+    def compact(self):
+        return {
+            "meta": {"approx_audio_duration_sec": self.total_dur},
+            "prosody_summary": {
+                "top_emotions": sorted(
+                    [{"name": n, "sum_score": s} for n, s in self.emotion_sum.items()],
+                    key=lambda x: x["sum_score"], reverse=True
+                )[:10],
+                "peak_events": [{"t": t, "name": n, "score": s} for (t, n, s) in self.peak_events[:10]],
+            },
+        }
 
 # =========================
 # Deterministic scoring (fallback)
@@ -269,29 +224,29 @@ TENSION  = {"Annoyance","Anxiety","Distress","Frustration","Irritation","Sadness
 ENERGY   = {"Excitement","Elation","Determination","Surprise"}
 ENGAGE   = {"Interest","Curiosity","Concentration","Enthusiasm","Attentiveness"}
 
-def _avg_over(agg: BatchResultProcessor, names: set) -> float:
-    if agg.total_dur <= 0: return 0.0
-    s = sum(agg.emotion_sum.get(n, 0.0) for n in names)
-    return 100.0 * (s / max(agg.total_dur, 1e-6))
+def _avg_over(total_dur: float, emotion_sum: Dict[str, float], names: set) -> float:
+    if total_dur <= 0: return 0.0
+    s = sum(emotion_sum.get(n, 0.0) for n in names)
+    return 100.0 * (s / max(total_dur, 1e-6))
 
-def compute_metrics(agg: BatchResultProcessor) -> dict:
-    warmth   = max(0, min(100, int(_avg_over(agg, POSITIVE))))
-    tension  = max(0, min(100, int(_avg_over(agg, TENSION))))
-    energy   = max(0, min(100, int(_avg_over(agg, ENERGY))))
-    engage   = max(0, min(100, int(_avg_over(agg, ENGAGE))))
+def compute_metrics(total_dur: float, emotion_sum: Dict[str, float], peak_events: List[Tuple[float,str,float]]) -> dict:
+    warmth   = max(0, min(100, int(_avg_over(total_dur, emotion_sum, POSITIVE))))
+    tension  = max(0, min(100, int(_avg_over(total_dur, emotion_sum, TENSION))))
+    energy   = max(0, min(100, int(_avg_over(total_dur, emotion_sum, ENERGY))))
+    engage   = max(0, min(100, int(_avg_over(total_dur, emotion_sum, ENGAGE))))
     empathy  = 50
-    if agg.peak_events:
-        has_tension  = any(n in TENSION for _, n, _ in agg.peak_events)
-        has_positive = any(n in POSITIVE for _, n, _ in agg.peak_events)
+    if peak_events:
+        has_tension  = any(n in TENSION for _, n, _ in peak_events)
+        has_positive = any(n in POSITIVE for _, n, _ in peak_events)
         empathy = 70 if (has_tension and has_positive) else (60 if has_positive else 50)
     vocal_conf = max(0, min(100, int(0.6*energy + 0.4*(100 - tension))))
     vocal_tone = max(0, min(100, int(0.5*warmth + 0.3*vocal_conf + 0.2*engage - 0.1*tension)))
-    ai_conf    = min(95, int(20 + 75 * min(1.0, agg.total_dur / 60.0)))
+    ai_conf    = min(95, int(20 + 75 * min(1.0, total_dur / 60.0)))
     return {"warmth": warmth, "tension": tension, "energy": energy, "engage": engage,
             "vocal_conf": vocal_conf, "vocal_tone": vocal_tone, "ai_conf": ai_conf}
 
-def build_report(agg: BatchResultProcessor, title_hint: str = "Vocal Tone Session") -> str:
-    m = compute_metrics(agg)
+def build_report_from_agg(agg: RealtimeAgg, title_hint: str = "Vocal Tone Session") -> str:
+    m = compute_metrics(agg.total_dur, agg.emotion_sum, agg.peak_events)
     top = sorted(agg.emotion_sum.items(), key=lambda x: x[1], reverse=True)[:2]
     top_lines = [f"• Strong **{n}** signal" for n, _ in top] or ["• Clear articulation", "• Stable prosody"]
     peaks = sorted(agg.peak_events, key=lambda x: x[2], reverse=True)[:2]
@@ -324,21 +279,101 @@ def build_report(agg: BatchResultProcessor, title_hint: str = "Vocal Tone Sessio
     )
 
 # =========================
-# Per-UID session state
+# Hume streaming session (forward whole 4s chunk)
+# =========================
+def _pcm8_to_pcm16(pcm8: bytes) -> bytes:
+    import array
+    a = array.array('B', pcm8)
+    out = array.array('h', ((x - 128) << 8 for x in a))
+    return out.tobytes()
+
+def _wav_from_pcm16(pcm16: bytes, sample_rate: int) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm16)
+    return buf.getvalue()
+
+class HumeStreamSession:
+    def __init__(self, uid: str, sample_rate: int):
+        self.uid = uid
+        self.sample_rate = int(sample_rate)
+        self.last_wall_ts = time.time()
+        self.active = False
+        self._client: Optional[AsyncHumeClient] = None
+        self._socket_cm = None
+        self._socket = None
+        self.agg = RealtimeAgg()
+
+    async def start(self):
+        if not (AsyncHumeClient and EMConfig and StreamConnectOptions and HUME_API_KEY):
+            raise RuntimeError("Hume streaming not configured.")
+        self._client = AsyncHumeClient(api_key=HUME_API_KEY)
+        self._socket_cm = self._client.expression_measurement.stream.connect(
+            options=StreamConnectOptions(config=EMConfig(prosody={}), interim_results=True)
+        )
+        self._socket = await self._socket_cm.__aenter__()
+        self.active = True
+        self.touch()
+        print(f"🟢 Hume stream opened (uid={self.uid}, fs={self.sample_rate}Hz)")
+
+    async def close(self):
+        try:
+            if self._socket_cm:
+                await self._socket_cm.__aexit__(None, None, None)
+        except Exception as e:
+            print(f"⚠️ Hume stream close error: {e}")
+        self.active = False
+        print(f"🔴 Hume stream closed (uid={self.uid})")
+
+    def touch(self):
+        self.last_wall_ts = time.time()
+
+    async def send_chunk(self, raw: bytes, codec: str):
+        if not self.active:
+            await self.start()
+        self.touch()
+
+        if codec == "pcm8":
+            raw = _pcm8_to_pcm16(raw)
+        elif codec != "pcm16":
+            raise ValueError(f"Unsupported codec={codec}; send pcm16 or pcm8.")
+
+        # Optional: sanity-check inferred duration (defensive)
+        # dur_sec = len(raw) / (2 * self.sample_rate)
+        # if dur_sec > 5.1: raise ValueError(f"Chunk too long ({dur_sec:.2f}s). Max 5s per message.")
+
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+        try:
+            wav_bytes = _wav_from_pcm16(raw, self.sample_rate)
+            tmp.write(wav_bytes); tmp.flush(); tmp.close()
+            result = await self._socket.send_file(file=tmp.name)
+            if isinstance(result, dict):
+                self.agg.ingest(result)
+        except Exception as e:
+            print(f"❌ Hume send_chunk error: {e}")
+        finally:
+            try: os.remove(tmp.name)
+            except Exception: pass
+
+# =========================
+# Per-UID state
 # =========================
 class VoiceState:
     def __init__(self, uid: str):
         self.uid = uid
-        self.active = False
-        self.started_at = 0.0
-        self.last_wall_ts = 0.0
-        self.last_audio_ts = 0.0
-        self.audio_buffer: List[bytes] = []
+        self.session: Optional[HumeStreamSession] = None
         self.sample_rate: int = 16000
-        self.codec: str = "pcm16"   # 'pcm16' | 'pcm8' | 'opus' | 'opusfs320'
+        self.codec: str = "pcm16"
+        self.started_at = 0.0
+        self.active = False
         self.lock = asyncio.Lock()
+
     def touch(self):
-        self.last_wall_ts = time.time()
+        if self.session:
+            self.session.touch()
 
 STATES: Dict[str, VoiceState] = {}
 STATES_LOCK = asyncio.Lock()
@@ -350,136 +385,42 @@ async def _get_state(uid: str) -> VoiceState:
         return STATES[uid]
 
 # =========================
-# Hume BATCH utilities (REST)
-# =========================
-def _bytes_to_wav_path(raw: bytes, sample_rate: int) -> str:
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-    tmp_path = tmp.name
-    tmp.close()
-    with wave.open(tmp_path, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)  # PCM16
-        wf.setframerate(sample_rate)
-        wf.writeframes(raw)
-    return tmp_path
-
-def _pcm8_to_pcm16(pcm8: bytes) -> bytes:
-    import array
-    a = array.array('B', pcm8)                   # unsigned 8-bit
-    out = array.array('h', ((x - 128) << 8 for x in a))
-    return out.tobytes()
-
-async def hume_measure_batch(audio_bytes: bytes, sample_rate: int) -> Optional[List[Dict[str, Any]]]:
-    if not (HUME_API_KEY and http_client):
-        print("❌ Hume REST: missing API key or HTTP client"); return None
-
-    wav_path = _bytes_to_wav_path(audio_bytes, sample_rate)
-    headers = {"X-Hume-Api-Key": HUME_API_KEY}
-    models = {"models": {"prosody": {}}}
-
-    job_id = None
-    f = None
-    try:
-        f = open(wav_path, "rb")
-        files = {
-            "json": (None, json.dumps(models), "application/json"),
-            "file": (os.path.basename(wav_path), f, "audio/wav"),
-        }
-        resp = await http_client.post("https://api.hume.ai/v0/batch/jobs", headers=headers, files=files, timeout=60.0)
-        if resp.status_code // 100 != 2:
-            print(f"❌ Hume REST: job submit failed {resp.status_code} {resp.text[:400]}"); return None
-        job_id = resp.json().get("job_id")
-        if not job_id:
-            print(f"❌ Hume REST: job_id missing in response: {resp.text[:300]}"); return None
-    except Exception as e:
-        print(f"❌ Hume REST: submit error: {e}"); return None
-    finally:
-        try:
-            if f: f.close()
-            os.remove(wav_path)
-        except Exception:
-            pass
-
-    status = "PENDING"
-    started = time.time()
-    delay = 1.0
-    while True:
-        try:
-            detail = await http_client.get(f"https://api.hume.ai/v0/batch/jobs/{job_id}", headers=headers, timeout=20.0)
-            if detail.status_code // 100 == 2:
-                j = detail.json()
-                status = (j.get("state") or {}).get("status", status)
-                if status == "COMPLETED": break
-                if status == "FAILED":
-                    print(f"❌ Hume REST: job {job_id} failed."); return None
-            else:
-                print(f"⚠️ Hume REST: status {detail.status_code} {detail.text[:200]}")
-        except Exception as e:
-            print(f"⚠️ Hume REST: poll error {e}")
-        if time.time() - started > 600:
-            print(f"❌ Hume REST: job {job_id} timed out."); return None
-        await asyncio.sleep(delay); delay = min(delay * 1.5, 6.0)
-
-    try:
-        preds = await http_client.get(f"https://api.hume.ai/v0/batch/jobs/{job_id}/predictions",
-                                      headers=headers, timeout=60.0)
-        if preds.status_code // 100 != 2:
-            print(f"❌ Hume REST: predictions fetch failed {preds.status_code} {preds.text[:400]}"); return None
-        return preds.json()
-    except Exception as e:
-        print(f"❌ Hume REST: predictions error {e}")
-        return None
-
-# =========================
-# Finalization: Build report
+# Finalization
 # =========================
 async def finalize_and_report(st: VoiceState, title_hint="Vocal Tone Session") -> Dict[str, Any]:
     uid = st.uid
     print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🟥 Finalizing uid={uid}")
 
-    if not st.audio_buffer:
-        print(f"⚠️ No audio buffered for uid={uid}. Skipping report.")
-        st.active = False; st.started_at = 0.0; st.touch()
-        return {"status": "ignored", "reason": "no_audio_buffered"}
+    if not st.session or not st.session.active:
+        print(f"⚠️ No active stream for uid={uid}.")
+        return {"status": "ignored", "reason": "no_active_stream"}
 
-    print(f"Combining {len(st.audio_buffer)} audio chunks for batch processing...")
-    full_audio_bytes = b"".join(st.audio_buffer)
+    agg = st.session.agg
+    report_text: Optional[str] = None
 
-    # Codec normalization to PCM16 mono
-    if st.codec == "pcm8":
-        full_audio_bytes = _pcm8_to_pcm16(full_audio_bytes)
-    elif st.codec in ("opus", "opusfs320"):
-        print("❌ Received Opus but decoder not enabled; please send PCM16 or add Opus decode.")
-        st.active = False; st.started_at = 0.0; st.touch()
-        return {"status": "error", "reason": "opus_not_supported_server_side"}
+    try:
+        hume_json_for_llm = agg.compact()
+        sys_prompt = HUME_ANALYSIS_SYSTEM_PROMPT
+        user_prompt = build_hume_user_prompt(hume_json_for_llm, title_hint=title_hint)
+        messages = [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_prompt}]
+        report_text = await call_llm(messages, temperature=0.2, max_tokens=1400)
+    except Exception as e:
+        print(f"❌ LLM pipeline error: {e}")
 
-    sample_rate = st.sample_rate
-    st.audio_buffer = []  # clear before long call
-
-    batch_result_json = await hume_measure_batch(full_audio_bytes, sample_rate)
-
-    if not batch_result_json:
-        print(f"❌ Hume Batch job failed or returned empty for uid={uid}.")
-        report_text = f'Vocal Tone: -- — "{title_hint}"\nAI Confidence: 0\n\nFailed to process audio with Hume Batch API.'
-    else:
-        processor = BatchResultProcessor(batch_result_json)
-        report_text: Optional[str] = None
-        try:
-            hume_json_for_llm = processor.compressed_json(topk_per_pred=5, min_score=0.15, max_preds=600)
-            sys_prompt = HUME_ANALYSIS_SYSTEM_PROMPT
-            user_prompt = build_hume_user_prompt(hume_json_for_llm, title_hint=title_hint)
-            messages = [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_prompt}]
-            report_text = await call_llm(messages, temperature=0.2, max_tokens=1400)
-        except Exception as e:
-            print(f"❌ LLM pipeline error: {e}")
-        if not report_text:
-            report_text = build_report(processor, title_hint=title_hint)
+    if not report_text:
+        report_text = build_report_from_agg(agg, title_hint=title_hint)
 
     await omi_send_notification(uid, title="Your Vocal Tone Report", body=report_text[:800])
     await omi_create_conversation(uid, report_text)
     await omi_save_memory(uid, report_text)
 
-    st.active = False; st.started_at = 0.0; st.touch()
+    try:
+        await st.session.close()
+    except Exception:
+        pass
+
+    st.active = False
+    st.started_at = 0.0
     return {"status": "success", "summary": {"report": report_text}}
 
 # =========================
@@ -490,19 +431,23 @@ async def health():
     return {
         "status": "ok",
         "omi_creds_loaded": bool(OMI_APP_ID and OMI_APP_SECRET),
-        "hume_ready": bool(HUME_API_KEY),
+        "hume_ready": bool(HUME_API_KEY and AsyncHumeClient and EMConfig and StreamConnectOptions),
         "llm_ready": bool(DEEPSEEK_API_KEY),
         "pid": PID,
-        "mode": "batch",
+        "mode": "stream_forward_4s",
     }
 
 @app.get("/hume/ping")
 async def hume_ping():
-    if not hume_client:
-        return {"ok": False, "error": "Hume not configured"}
+    if not (HUME_API_KEY and AsyncHumeClient and EMConfig and StreamConnectOptions):
+        return {"ok": False, "error": "Hume streaming not configured"}
     try:
-        await hume_client.expression_measurement.batch.list_jobs(limit=1)
-        return {"ok": True, "ping_target": "batch_list_jobs"}
+        client = AsyncHumeClient(api_key=HUME_API_KEY)
+        async with client.expression_measurement.stream.connect(
+            options=StreamConnectOptions(config=EMConfig(prosody={}))
+        ) as socket:
+            jd = await socket.get_job_details()
+            return {"ok": True, "ping_target": "stream.connect", "job_details": bool(jd)}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -518,36 +463,42 @@ async def audio_ingest(
     uid: Optional[str] = Query(None),
     session_id: Optional[str] = Query(None),
     sample_rate: int = Query(16000),
-    codec: str = Query("pcm16"),  # 'pcm16' | 'pcm8' | 'opus' | 'opusfs320'
+    codec: str = Query("pcm16"),  # 'pcm16' | 'pcm8'
 ):
     key = uid or session_id or request.headers.get("X-Session-ID") or request.headers.get("X-Omi-Uid")
     if not key:
         return {"status": "ignored", "reason": "missing_uid_or_session_id"}
 
-    st = await _get_state(key)
-    body = await request.body()
-    now = time.time()
-    if not body:
+    raw = await request.body()
+    if not raw:
         return {"status": "ignored", "reason": "empty_body"}
 
-    async with st.lock:
-        if st.active and st.last_wall_ts and (now - st.last_wall_ts > IDLE_TIMEOUT_SEC):
-            print(f"⏰ Idle timeout for uid={key} — auto-finalize")
-            await finalize_and_report(st)
+    if codec.lower() not in SUPPORTED_CODECS:
+        return {"status": "error", "reason": f"unsupported_codec:{codec}"}
 
-        if not st.active:
-            st.active = True
-            st.started_at = now
-            st.audio_buffer = []
+    st = await _get_state(key)
+    async with st.lock:
+        # idle auto-finalize
+        if st.active and st.session and (time.time() - st.session.last_wall_ts > IDLE_TIMEOUT_SEC):
+            print(f"⏰ Idle timeout for uid={key} — auto-finalize")
+            return await finalize_and_report(st)
+
+        # start session on first audio
+        if not st.active or not st.session:
             st.sample_rate = sample_rate
             st.codec = codec.lower()
-            print(f"🟢 session starts (uid={key}, sample_rate={sample_rate}, codec={st.codec})")
+            st.session = HumeStreamSession(key, sample_rate=sample_rate)
+            await st.session.start()
+            st.active = True
+            st.started_at = time.time()
+            print(f"🟢 session starts (uid={key}, fs={sample_rate}, codec={st.codec})")
 
-        st.touch()
-        st.last_audio_ts = now
-        st.audio_buffer.append(body)
+        try:
+            await st.session.send_chunk(raw, st.codec)  # forward entire ~4s chunk
+        except Exception as e:
+            return {"status": "error", "reason": f"send_chunk_failed:{e}"}
 
-    return {"status": "ok_buffered", "received": len(body), "sample_rate": sample_rate, "codec": st.codec}
+    return {"status": "ok_forwarded", "received": len(raw), "sample_rate": sample_rate, "codec": st.codec}
 
 @app.post("/conversation/end")
 async def conversation_end(uid: Optional[str] = Query(None), session_id: Optional[str] = Query(None)):
@@ -556,7 +507,7 @@ async def conversation_end(uid: Optional[str] = Query(None), session_id: Optiona
         return {"status": "ignored", "reason": "missing_uid_or_session_id"}
     st = await _get_state(key)
     async with st.lock:
-        if not st.active:
+        if not st.active or not st.session:
             return {"status": "ignored", "reason": "not_active"}
         return await finalize_and_report(st)
 
@@ -564,5 +515,5 @@ async def conversation_end(uid: Optional[str] = Query(None), session_id: Optiona
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 10000))
-    print(f"Starting Hume Vocal Tone server (BATCH MODE) on http://0.0.0.0:{port} (pid={PID})")
+    print(f"Starting Hume Vocal Tone server (STREAM MODE, 4s) on http://0.0.0.0:{port} (pid={PID})")
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
