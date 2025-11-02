@@ -38,7 +38,7 @@ from fastapi import FastAPI, Request, Query, Response
 # ---- Hume streaming SDK (install: pip install "hume[stream]") ----------------
 try:
     from hume.client import AsyncHumeClient
-    from hume import StreamDataModels
+    from hume.models.config import StreamDataModels
 except Exception:
     AsyncHumeClient = None
     StreamDataModels = None
