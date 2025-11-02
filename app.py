@@ -42,7 +42,6 @@ from hume.models.config import ProsodyConfig, BurstConfig
 # =========================
 OMI_APP_ID = os.environ.get("OMI_APP_ID")
 OMI_APP_SECRET = os.environ.get("OMI_APP_SECRET")     # for notifications
-OMI_API_KEY = os.environ.get("OMI_API_KEY")           # for Imports (conversations/memories)
 
 HUME_API_KEY = os.environ.get("HUME_API_KEY")
 
@@ -100,10 +99,10 @@ app = FastAPI(title="Vocal Tone (Hume Prosody x Omi x LLM)", lifespan=lifespan)
 # Omi helpers
 # =========================
 async def omi_create_conversation(uid: str, text: str):
-    if not (OMI_APP_ID and OMI_API_KEY and http_client):
+    if not (OMI_APP_ID and OMI_APP_SECRET and http_client):
         return
     url = f"https://api.omi.me/v2/integrations/{OMI_APP_ID}/user/conversations"
-    headers = {"Authorization": f"Bearer {OMI_API_KEY}", "Content-Type": "application/json"}
+    headers = {"Authorization": f"Bearer {OMI_APP_SECRET}", "Content-Type": "application/json"}
     params = {"uid": uid}
     payload = {"text": text, "text_source": "other_text", "text_source_spec": "vocal_tone_report", "language": "en"}
     r = await http_client.post(url, headers=headers, params=params, json=payload)
@@ -125,7 +124,7 @@ async def omi_send_notification(uid: str, title: str, body: str):
         print(f"❌ Omi notification error: {e}")
 
 async def omi_save_memory(uid: str, full_text: str):
-    if not (OMI_APP_ID and OMI_API_KEY and http_client):
+    if not (OMI_APP_ID and OMI_APP_SECRET and http_client):
         return
     try:
         # Ensure full text is stored as a conversation
@@ -133,7 +132,7 @@ async def omi_save_memory(uid: str, full_text: str):
 
         # Create a short memory entry
         url = f"https://api.omi.me/v2/integrations/{OMI_APP_ID}/user/memories"
-        headers = {"Authorization": f"Bearer {OMI_API_KEY}", "Content-Type": "application/json"}
+        headers = {"Authorization": f"Bearer {OMI_APP_SECRET}", "Content-Type": "application/json"}
         params = {"uid": uid}
         first_line = (full_text.splitlines() or [""])[0][:300]
         payload = {
@@ -467,7 +466,7 @@ async def finalize_and_report(st: VoiceState, title_hint="Vocal Tone Session") -
 async def health():
     return {
         "status": "ok",
-        "omi_creds_loaded": bool(OMI_APP_ID and (OMI_APP_SECRET or OMI_API_KEY)),
+        "omi_creds_loaded": bool(OMI_APP_ID and OMI_APP_SECRET),
         "hume_ready": bool(HUME_API_KEY),
         "llm_ready": bool(DEEPSEEK_API_KEY),
         "pid": PID
