@@ -1,6 +1,7 @@
 # --------------------------------------------------------------------
-# Vocal Tone (Hume Prosody) -> LLM Report (DeepSeek) -> Push to Omi
-# Deterministic fallback included (no LLM required if call fails)
+# Vocal Tone (Hume Batch) -> LLM Report (DeepSeek) -> Push to Omi
+# This version buffers all audio and uses the BATCH API at the end
+# of the conversation.
 #
 # Requires:
 #   pip install -r requirements.txt
@@ -33,7 +34,7 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI, Request, Query
 
-# ---------------- Hume SDK (robust imports; no socket_client) ----------------
+# ---------------- Hume SDK (robust imports) ----------------
 try:
     from hume.client import AsyncHumeClient  # preferred in current SDKs
 except Exception:
@@ -50,15 +51,15 @@ try:
 except Exception:
     HumeStreamDataModels = None  # optional fallback
 
-# --- FIX 1: ADD IMPORT FOR ERROR HANDLING ---
+# Import for Error Handling (though we'll use batch, it's good practice)
 try:
     from hume.models.stream import StreamErrorMessage
 except ImportError:
     try:
         from hume.expression_measurement.stream.stream_socket import StreamErrorMessage
     except ImportError:
-        StreamErrorMessage = None  # We'll use hasattr as a fallback
-# --------------------------------------------
+        StreamErrorMessage = None
+# -----------------------------------------------------------
 
 PID = os.getpid()
 
@@ -77,7 +78,9 @@ DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.co
 
 # Session controls
 IDLE_TIMEOUT_SEC = int(os.environ.get("IDLE_TIMEOUT_SEC", "180"))  # finalize if idle this long
-MAX_CHUNK_SEC = float(os.environ.get("MAX_CHUNK_SEC", "4.8"))      # keep <5s for Hume stream slices
+
+# NOTE: MAX_CHUNK_SEC is no longer relevant as we are not streaming to Hume
+# MAX_CHUNK_SEC = float(os.environ.get("MAX_CHUNK_SEC", "4.8"))
 
 # Optional markers (not used by /audio, but handy if you later add text triggers)
 START_RE = re.compile(r"\bconversation\s*starts\b", re.I)
@@ -92,7 +95,7 @@ hume_client: Optional[AsyncHumeClient] = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global http_client, hume_client
-    print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🚀 Hume Vocal Tone server starting...")
+    print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🚀 Hume Vocal Tone server (BATCH MODE) starting...")
     http_client = httpx.AsyncClient(timeout=45.0)
     hume_client = AsyncHumeClient(api_key=HUME_API_KEY) if HUME_API_KEY else None
     try:
@@ -102,7 +105,7 @@ async def lifespan(app: FastAPI):
             await http_client.aclose()
         print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 👋 Server shutting down...")
 
-app = FastAPI(title="Vocal Tone (Hume Prosody x Omi x DeepSeek)", lifespan=lifespan)
+app = FastAPI(title="Vocal Tone (Hume Batch x Omi x DeepSeek)", lifespan=lifespan)
 
 # =========================
 # Omi helpers (use OMI_APP_SECRET for ALL endpoints)
@@ -312,59 +315,87 @@ Hume Prosody JSON:
 """
 
 # =========================
-# Aggregation & compression
+# NEW: Batch Result Processor
+# (This replaces the old streaming 'EmotionAgg')
 # =========================
-class EmotionAgg:
+class BatchResultProcessor:
     """
-    Rolling aggregator of Hume prosody outputs across slices.
-    Also stores full predictions for the LLM (with light compression later).
+    Parses a full Hume BATCH API response.
+    Populates attributes needed for both deterministic and LLM reports.
+    Designed as a drop-in replacement for the old 'EmotionAgg' class.
     """
-    def __init__(self):
+    def __init__(self, batch_result_json: List[Dict[str, Any]]):
         self.total_dur = 0.0
-        self.predictions: List[Dict[str, Any]] = []  # store raw predictions for LLM
-        self.emotion_sum: Dict[str, float] = {}
-        self.peak_events: List[Tuple[float, str, float]] = []  # (timestamp, name, score)
-
-    # --- FIX 2: UPDATE THIS FUNCTION TO HANDLE ERRORS ---
-    def add_predictions(self, result: Any, slice_dur: float, t0: float):
-        # --- FIX: Check for an error attribute FIRST ---
-        if hasattr(result, "error"):
-            print(f"❌ Aggregator received Hume error: {getattr(result, 'error', 'Unknown Error')}")
-            return # Stop processing this chunk
-
-        # Check if it's a valid dict-like object
-        if not hasattr(result, "get"):
-            print(f"❌ Aggregator received invalid/unknown result type: {type(result)}")
-            return # Stop processing this chunk
-        # --- END FIX ---
-
-        prosody = result.get("prosody") or result.get("models", {}).get("prosody")
-        if not prosody:
-            return # Handles valid, but empty, results
+        self.predictions: List[Dict[str, Any]] = []  # For LLM
+        self.emotion_sum: Dict[str, float] = {}      # For deterministic fallback
+        self.peak_events: List[Tuple[float, str, float]] = []  # For deterministic fallback
         
-        preds = prosody.get("predictions", [])
-        for p in preds:
+        try:
+            self._parse_batch_json(batch_result_json)
+        except Exception as e:
+            print(f"❌ BatchResultProcessor: Failed to parse Hume batch JSON: {e}")
+            print(f"Data dump (first 1000 chars): {json.dumps(batch_result_json, indent=2)[:1000]}")
+
+    def _parse_batch_json(self, batch_result_json: List[Dict[str, Any]]):
+        # Batch API returns a list, one item per source file. We only sent one.
+        if not batch_result_json:
+            print("❌ BatchResultProcessor: JSON is empty.")
+            return
+
+        # Get the prosody predictions for the first file
+        file_result = batch_result_json[0]
+        if 'results' not in file_result or 'predictions' not in file_result['results']:
+            print(f"❌ BatchResultProcessor: 'results' or 'predictions' not in {file_result.keys()}")
+            return
+            
+        first_prediction_set = file_result['results']['predictions'][0]
+        if 'models' not in first_prediction_set or 'prosody' not in first_prediction_set['models']:
+            print(f"❌ BatchResultProcessor: 'models' or 'prosody' not in {first_prediction_set.keys()}")
+            return
+
+        prosody_data = first_prediction_set['models']['prosody']
+        all_preds = prosody_data.get('predictions', [])
+        
+        if not all_preds:
+            print("BatchResultProcessor: Prosody model ran but found no predictions.")
+            return
+
+        # Find total duration
+        self.total_dur = max(float(p.get('time', {}).get('end', 0.0)) for p in all_preds)
+
+        for p in all_preds:
             time_obj = p.get("time", {})
             begin = float(time_obj.get("begin", 0.0))
             end_v = float(time_obj.get("end", begin))
+            
             emotions = p.get("emotions", [])
-            # track totals & peaks
+            
+            # 1. Populate data for deterministic fallback
             for e in emotions:
                 name = str(e.get("name", "unknown")).strip()
                 score = float(e.get("score", 0.0))
+                # Note: This is an unweighted sum, matching the old streaming logic.
                 self.emotion_sum[name] = self.emotion_sum.get(name, 0.0) + score
                 if score >= 0.75:
-                    self.peak_events.append((t0 + begin, name, score))
-            # keep raw-ish for LLM
+                    self.peak_events.append((begin, name, score)) # Use relative 'begin' timestamp
+            
+            # 2. Populate data for LLM analysis (this is the same structure as streaming)
+            p_speaker = p.get("speaker") or p.get("person") or None
+            p_emotions_list = []
+            for e in emotions:
+                p_emotions_list.append({
+                    "name": e.get("name", "unknown"),
+                    "score": float(e.get("score", 0.0))
+                })
+
             self.predictions.append({
-                "time": {"begin": begin + t0, "end": end_v + t0},
-                "emotions": [{"name": e.get("name"), "score": float(e.get("score", 0.0))} for e in emotions],
-                "speaker": p.get("speaker") or p.get("person") or None
+                "time": {"begin": begin, "end": end_v},
+                "emotions": p_emotions_list,
+                "speaker": p_speaker
             })
-        self.total_dur += max(slice_dur, 1e-6)
-    # --- END FIX 2 ---
 
     def compressed_json(self, topk_per_pred=5, min_score=0.15, max_preds=600) -> Dict[str, Any]:
+        """Compresses the full prediction list for the LLM prompt."""
         preds_out = []
         for p in self.predictions[:max_preds]:
             emos = p.get("emotions", [])
@@ -377,19 +408,24 @@ class EmotionAgg:
             })
         return {"meta": {"audio_duration_sec": self.total_dur}, "prosody": {"predictions": preds_out}}
 
+# =========================
 # Deterministic scoring (fallback)
+# (This section is unchanged, it now reads from BatchResultProcessor)
+# =========================
 POSITIVE = {"Admiration","Amusement","Awe","Calmness","Contentment","Interest","Joy","Relief","Triumph","Tenderness"}
 TENSION  = {"Annoyance","Anxiety","Distress","Frustration","Irritation","Sadness","Disappointment","Contempt","Anger","Doubt"}
 ENERGY   = {"Excitement","Elation","Determination","Surprise"}
 ENGAGE   = {"Interest","Curiosity","Concentration","Enthusiasm","Attentiveness"}
 
-def _avg_over(agg: EmotionAgg, names: set) -> float:
+def _avg_over(agg: BatchResultProcessor, names: set) -> float:
     if agg.total_dur <= 0:
         return 0.0
+    # Note: This was always (sum of scores) / (total duration).
+    # This is not a true average, but it's consistent with the old code.
     s = sum(agg.emotion_sum.get(n, 0.0) for n in names)
     return 100.0 * (s / max(agg.total_dur, 1e-6))
 
-def compute_metrics(agg: EmotionAgg) -> dict:
+def compute_metrics(agg: BatchResultProcessor) -> dict:
     warmth   = max(0, min(100, int(_avg_over(agg, POSITIVE))))
     tension  = max(0, min(100, int(_avg_over(agg, TENSION))))
     energy   = max(0, min(100, int(_avg_over(agg, ENERGY))))
@@ -405,7 +441,7 @@ def compute_metrics(agg: EmotionAgg) -> dict:
     return {"warmth": warmth, "tension": tension, "energy": energy, "engage": engage,
             "vocal_conf": vocal_conf, "vocal_tone": vocal_tone, "ai_conf": ai_conf}
 
-def build_report(agg: EmotionAgg, title_hint: str = "Vocal Tone Session") -> str:
+def build_report(agg: BatchResultProcessor, title_hint: str = "Vocal Tone Session") -> str:
     m = compute_metrics(agg)
     top = sorted(agg.emotion_sum.items(), key=lambda x: x[1], reverse=True)[:2]
     top_lines = [f"• Strong **{n}** signal" for n, _ in top] or ["• Clear articulation", "• Stable prosody"]
@@ -445,6 +481,7 @@ def build_report(agg: EmotionAgg, title_hint: str = "Vocal Tone Session") -> str
 
 # =========================
 # Per-UID session state
+# (MODIFIED FOR BATCH)
 # =========================
 class VoiceState:
     def __init__(self, uid: str):
@@ -453,7 +490,8 @@ class VoiceState:
         self.started_at = 0.0
         self.last_wall_ts = 0.0
         self.last_audio_ts = 0.0
-        self.agg = EmotionAgg()
+        self.audio_buffer: List[bytes] = [] # MOD: This replaces EmotionAgg
+        self.sample_rate: int = 16000       # MOD: Store sample rate
         self.lock = asyncio.Lock()
 
     def touch(self):
@@ -469,7 +507,8 @@ async def _get_state(uid: str) -> VoiceState:
         return STATES[uid]
 
 # =========================
-# Hume streaming utilities
+# Hume BATCH utilities
+# (REPLACES streaming utilities)
 # =========================
 def _bytes_to_wav_path(raw: bytes, sample_rate: int) -> str:
     """Wrap raw PCM16 mono bytes with a WAV header to a temp file and return the path."""
@@ -483,61 +522,107 @@ def _bytes_to_wav_path(raw: bytes, sample_rate: int) -> str:
         wf.writeframes(raw)
     return tmp_path
 
-# --- FIX 3: CORRECT THIS HELPER AND API CALLS ---
 def _build_stream_config() -> Any:
-    """Build Hume stream 'config' object in a version-resilient way."""
+    """
+    Build Hume stream 'config' object in a version-resilient way.
+    This is also used by the batch API's `submit_file` config.
+    """
     if EMConfig is not None:
         return EMConfig(prosody={})  # Return the object directly
     if HumeStreamDataModels is not None:
         return HumeStreamDataModels(prosody={})  # Return the object directly
     return {"prosody": {}}  # Fallback to a plain dict
 
-async def hume_measure_bytes(audio_bytes: bytes, sample_rate: int) -> Optional[Dict[str, Any]]:
-    """Use Hume Expression Measurement (Prosody) stream for a short chunk."""
+async def hume_measure_batch(audio_bytes: bytes, sample_rate: int) -> Optional[List[Dict[str, Any]]]:
+    """Use Hume Expression Measurement (Batch) for a full audio file."""
     if not hume_client:
-        print("❌ Hume client not configured")
+        print("❌ Hume client (batch) not configured")
         return None
     
-    stream_config = _build_stream_config()
+    batch_config = _build_stream_config() 
     wav_path = _bytes_to_wav_path(audio_bytes, sample_rate)
-    
+    job = None
     try:
-        # Call connect() with NO arguments
-        async with hume_client.expression_measurement.stream.connect() as socket:
-            # Pass the config to send_file()
-            result = await socket.send_file(wav_path, config=stream_config)
-            return result
+        print(f"Hume Batch: Submitting file {wav_path} ({len(audio_bytes) / (sample_rate * 2):.2f}s)")
+        # NOTE: submit_file is a method on the BatchClient, not stream
+        job = await hume_client.expression_measurement.batch.submit_file(wav_path, config=batch_config)
+        print(f"Hume Batch: Job {job.id} submitted. Awaiting completion (this may take a moment)...")
+        
+        # Wait for the job to complete
+        await job.await_complete(timeout=600.0) # 10-minute timeout
+        
+        print(f"Hume Batch: Job {job.id} completed.")
+        
+        preds = await job.get_predictions()
+        if not preds:
+            print(f"❌ Hume Batch: Job {job.id} returned no predictions.")
+            return None
+        return preds
     except Exception as e:
-        print(f"❌ Hume stream error: {e}")
+        print(f"❌ Hume Batch error: {e}")
+        if job:
+            try:
+                details = await job.get_details()
+                print(f"Job details: {details}")
+            except Exception as de:
+                print(f"Failed to get job details: {de}")
         return None
     finally:
         try:
             os.remove(wav_path)
         except Exception:
             pass
-# --- END FIX 3 ---
 
 # =========================
-# Finalization: Build report (LLM first, deterministic fallback)
+# Finalization: Build report
+# (MODIFIED FOR BATCH)
 # =========================
 async def finalize_and_report(st: VoiceState, title_hint="Vocal Tone Session") -> Dict[str, Any]:
     uid = st.uid
     print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🟥 Finalizing uid={uid}")
 
-    # 1) Try LLM-based report
-    report_text: Optional[str] = None
-    try:
-        hume_json = st.agg.compressed_json(topk_per_pred=5, min_score=0.15, max_preds=600)
-        sys_prompt = HUME_ANALYSIS_SYSTEM_PROMPT
-        user_prompt = build_hume_user_prompt(hume_json, title_hint=title_hint)
-        messages = [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_prompt}]
-        report_text = await call_llm(messages, temperature=0.2, max_tokens=1400)
-    except Exception as e:
-        print(f"❌ LLM pipeline error: {e}")
+    # --- BATCH LOGIC START ---
+    if not st.audio_buffer:
+        print(f"⚠️ No audio buffered for uid={uid}. Skipping report.")
+        # Reset state anyway
+        st.active = False
+        st.started_at = 0.0
+        st.touch()
+        return {"status": "ignored", "reason": "no_audio_buffered"}
 
-    # 2) Fallback deterministic report if LLM missing/fails
-    if not report_text:
-        report_text = build_report(st.agg, title_hint=title_hint)
+    print(f"Combining {len(st.audio_buffer)} audio chunks for batch processing...")
+    full_audio_bytes = b"".join(st.audio_buffer)
+    sample_rate = st.sample_rate # Get sample rate from state
+    
+    # Reset buffer *before* long-running API call
+    st.audio_buffer = [] 
+    
+    # Call Batch API (this can take time)
+    batch_result_json = await hume_measure_batch(full_audio_bytes, sample_rate)
+
+    if not batch_result_json:
+        print(f"❌ Hume Batch job failed or returned empty for uid={uid}.")
+        # Fallback to a very simple deterministic report
+        report_text = f'Vocal Tone: -- — "{title_hint}"\nAI Confidence: 0\n\nFailed to process audio with Hume Batch API.'
+    else:
+        # NEW: Process the full batch JSON using our new parser class
+        processor = BatchResultProcessor(batch_result_json)
+        
+        # 1) Try LLM-based report
+        report_text: Optional[str] = None
+        try:
+            hume_json_for_llm = processor.compressed_json(topk_per_pred=5, min_score=0.15, max_preds=600)
+            sys_prompt = HUME_ANALYSIS_SYSTEM_PROMPT
+            user_prompt = build_hume_user_prompt(hume_json_for_llm, title_hint=title_hint)
+            messages = [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_prompt}]
+            report_text = await call_llm(messages, temperature=0.2, max_tokens=1400)
+        except Exception as e:
+            print(f"❌ LLM pipeline error: {e}")
+
+        # 2) Fallback deterministic report if LLM missing/fails
+        if not report_text:
+            report_text = build_report(processor, title_hint=title_hint) # Pass the processor object
+    # --- BATCH LOGIC END ---
 
     # Push to Omi (ALL endpoints use OMI_APP_SECRET)
     await omi_send_notification(uid, title="Your Vocal Tone Report", body=report_text[:800])
@@ -546,7 +631,6 @@ async def finalize_and_report(st: VoiceState, title_hint="Vocal Tone Session") -
 
     # Reset state
     st.active = False
-    st.agg = EmotionAgg()
     st.started_at = 0.0
     st.touch()
 
@@ -563,17 +647,18 @@ async def health():
         "hume_ready": bool(HUME_API_KEY),
         "llm_ready": bool(DEEPSEEK_API_KEY),
         "pid": PID,
+        "mode": "batch",
     }
 
 @app.get("/hume/ping")
 async def hume_ping():
+    """Pings the BATCH client by listing recent jobs."""
     if not hume_client:
         return {"ok": False, "error": "Hume not configured"}
     try:
-        # --- FIX 3 (continued): Correct the ping call ---
-        async with hume_client.expression_measurement.stream.connect():
-            pass
-        return {"ok": True}
+        # Pinging batch is safer; just list jobs
+        await hume_client.expression_measurement.batch.list_jobs(limit=1)
+        return {"ok": True, "ping_target": "batch_list_jobs"}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -591,11 +676,8 @@ async def audio_ingest(
     sample_rate: int = Query(16000),
 ):
     """
-    Omi posts raw audio bytes here every ~3–5s:
-      POST /audio?sample_rate=16000&uid={{userId}}
-    or
-      POST /audio?sample_rate=16000&session_id={{sessionId}}
-    Body: application/octet-stream (raw PCM16 mono bytes)
+    Omi posts raw audio bytes here.
+    This endpoint now BUFFERS audio and does NOT call Hume.
     """
     key = uid or session_id or request.headers.get("X-Session-ID") or request.headers.get("X-Omi-Uid")
     if not key:
@@ -610,6 +692,7 @@ async def audio_ingest(
 
     async with st.lock:
         # Idle finalize before new chunk (if needed)
+        # FIX: Corrected typo from IDLE_TOKEN_SEC to IDLE_TIMEOUT_SEC
         if st.active and st.last_wall_ts and (now - st.last_wall_ts > IDLE_TIMEOUT_SEC):
             print(f"⏰ Idle timeout for uid={key} — auto-finalize")
             await finalize_and_report(st)
@@ -617,27 +700,17 @@ async def audio_ingest(
         if not st.active:
             st.active = True
             st.started_at = now
-            st.agg = EmotionAgg()
-            print(f"🟢 session starts (uid={key})")
+            st.audio_buffer = []      # MOD: Reset buffer
+            st.sample_rate = sample_rate  # MOD: Store sample rate
+            print(f"🟢 session starts (uid={key}, sample_rate={sample_rate})")
 
         st.touch()
         st.last_audio_ts = now
+        
+        # MOD: Just buffer the audio bytes
+        st.audio_buffer.append(body)
 
-    # Estimate duration assuming PCM16 mono
-    approx_dur = len(body) / 2.0 / max(sample_rate, 1)
-
-    # Send slice to Hume
-    res = await hume_measure_bytes(body, sample_rate)
-    
-    # This call is now safe thanks to Fix 2
-    if res:
-        async with st.lock:
-            st.agg.add_predictions(res, approx_dur, t0=now - approx_dur)
-    else:
-        # This will now be printed if hume_measure_bytes catches an error
-        print(f"⚠️ Hume returned no result for uid={key}")
-
-    return {"status": "ok", "received": len(body), "sample_rate": sample_rate}
+    return {"status": "ok_buffered", "received": len(body), "sample_rate": sample_rate}
 
 @app.post("/conversation/end")
 async def conversation_end(uid: Optional[str] = Query(None), session_id: Optional[str] = Query(None)):
@@ -648,11 +721,12 @@ async def conversation_end(uid: Optional[str] = Query(None), session_id: Optiona
     async with st.lock:
         if not st.active:
             return {"status": "ignored", "reason": "not_active"}
+        # This will now trigger the full batch process
         return await finalize_and_report(st)
 
 # Entrypoint
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 10000))
-    print(f"Starting Hume Vocal Tone server on http://0.0.0.0:{port} (pid={PID})")
+    print(f"Starting Hume Vocal Tone server (BATCH MODE) on http://0.0.0.0:{port} (pid={PID})")
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
