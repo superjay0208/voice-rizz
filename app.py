@@ -50,7 +50,15 @@ try:
 except Exception:
     HumeStreamDataModels = None  # optional fallback
 
-# ---------------------------------------------------------------------------
+# --- FIX 1: ADD IMPORT FOR ERROR HANDLING ---
+try:
+    from hume.models.stream import StreamErrorMessage
+except ImportError:
+    try:
+        from hume.expression_measurement.stream.stream_socket import StreamErrorMessage
+    except ImportError:
+        StreamErrorMessage = None  # We'll use hasattr as a fallback
+# --------------------------------------------
 
 PID = os.getpid()
 
@@ -317,10 +325,20 @@ class EmotionAgg:
         self.emotion_sum: Dict[str, float] = {}
         self.peak_events: List[Tuple[float, str, float]] = []  # (timestamp, name, score)
 
-    def add_predictions(self, result: Dict[str, Any], slice_dur: float, t0: float):
+    # --- FIX 2: UPDATE THIS FUNCTION TO HANDLE ERRORS ---
+    def add_predictions(self, result: Any, slice_dur: float, t0: float):
+        # Check if 'result' is an error or not a dict-like object
+        if not hasattr(result, "get"):
+            if StreamErrorMessage and isinstance(result, StreamErrorMessage):
+                print(f"❌ Aggregator received Hume error: {result.error}")
+            else:
+                print(f"❌ Aggregator received invalid result type: {type(result)}")
+            return # Stop processing this chunk
+
         prosody = result.get("prosody") or result.get("models", {}).get("prosody")
         if not prosody:
-            return
+            return # Handles valid, but empty, results
+        
         preds = prosody.get("predictions", [])
         for p in preds:
             time_obj = p.get("time", {})
@@ -341,6 +359,7 @@ class EmotionAgg:
                 "speaker": p.get("speaker") or p.get("person") or None
             })
         self.total_dur += max(slice_dur, 1e-6)
+    # --- END FIX 2 ---
 
     def compressed_json(self, topk_per_pred=5, min_score=0.15, max_preds=600) -> Dict[str, Any]:
         preds_out = []
@@ -461,6 +480,7 @@ def _bytes_to_wav_path(raw: bytes, sample_rate: int) -> str:
         wf.writeframes(raw)
     return tmp_path
 
+# --- FIX 3: CORRECT THIS HELPER AND API CALLS ---
 def _build_stream_config() -> Any:
     """Build Hume stream 'config' object in a version-resilient way."""
     if EMConfig is not None:
@@ -475,14 +495,13 @@ async def hume_measure_bytes(audio_bytes: bytes, sample_rate: int) -> Optional[D
         print("❌ Hume client not configured")
         return None
     
-    # 1. Get the config object from the fixed helper
-    stream_config = _build_stream_config() 
-    
+    stream_config = _build_stream_config()
     wav_path = _bytes_to_wav_path(audio_bytes, sample_rate)
+    
     try:
-        # 2. Call connect() with NO arguments
+        # Call connect() with NO arguments
         async with hume_client.expression_measurement.stream.connect() as socket:
-            # 3. Pass the config to send_file() instead
+            # Pass the config to send_file()
             result = await socket.send_file(wav_path, config=stream_config)
             return result
     except Exception as e:
@@ -493,6 +512,8 @@ async def hume_measure_bytes(audio_bytes: bytes, sample_rate: int) -> Optional[D
             os.remove(wav_path)
         except Exception:
             pass
+# --- END FIX 3 ---
+
 # =========================
 # Finalization: Build report (LLM first, deterministic fallback)
 # =========================
@@ -546,13 +567,13 @@ async def hume_ping():
     if not hume_client:
         return {"ok": False, "error": "Hume not configured"}
     try:
-        # Call connect() with NO arguments
+        # --- FIX 3 (continued): Correct the ping call ---
         async with hume_client.expression_measurement.stream.connect():
             pass
         return {"ok": True}
     except Exception as e:
         return {"ok": False, "error": str(e)}
-        
+
 @app.get("/llm/ping")
 async def llm_ping():
     msgs = [{"role": "system", "content": "Return ONLY: ok"}, {"role": "user", "content": "ok"}]
@@ -604,10 +625,13 @@ async def audio_ingest(
 
     # Send slice to Hume
     res = await hume_measure_bytes(body, sample_rate)
+    
+    # This call is now safe thanks to Fix 2
     if res:
         async with st.lock:
             st.agg.add_predictions(res, approx_dur, t0=now - approx_dur)
     else:
+        # This will now be printed if hume_measure_bytes catches an error
         print(f"⚠️ Hume returned no result for uid={key}")
 
     return {"status": "ok", "received": len(body), "sample_rate": sample_rate}
