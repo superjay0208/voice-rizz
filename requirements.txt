@@ -1,7 +1,0 @@
-httpx>=0.27
-fastapi>=0.115
-uvicorn[standard]>=0.30
-pydantic>=2.8
-python-dotenv>=1.0  # optional, if you use .env locally
-hume[stream]
-websockets>=12
