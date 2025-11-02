@@ -1,12 +1,23 @@
 # --------------------------------------------------------------------
-# Vocal Tone (Hume STREAM, 4s chunks) -> LLM Report (DeepSeek) -> Push to Omi
-# For each POST /audio, forward the whole (≈4s) chunk to Hume stream.
+# Vocal Tone (Hume STREAM, ~4s chunks) -> LLM Report (DeepSeek) -> Push to Omi
 #
-# Run (Render Start Command):
+# Start (Render):
 #   uvicorn app:app --host 0.0.0.0 --port $PORT
+#
 # Client (Omi):
-#   POST raw audio to /audio?uid=...&sample_rate=16000&codec=pcm16  (≈4s per request)
-#   POST /conversation/end?uid=...  to finalize
+#   POST raw audio bytes to /audio?uid=...&sample_rate=16000&codec=pcm16  (≈4s per request)
+#   POST /conversation/end?uid=...  to finalize & push report to Omi
+#
+# ENV:
+#   OMI_APP_ID, OMI_APP_SECRET
+#   HUME_API_KEY
+#   DEEPSEEK_API_KEY, DEEPSEEK_MODEL (default deepseek-reasoner), DEEPSEEK_BASE_URL
+#
+# requirements.txt (pin an SDK with streaming support):
+#   hume[stream]==0.13.1
+#   fastapi==0.115.0
+#   uvicorn==0.30.6
+#   httpx>=0.27
 # --------------------------------------------------------------------
 
 import os
@@ -22,17 +33,15 @@ from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, Request, Query
+from fastapi import FastAPI, Request, Query, Response
 
-# ---- Hume streaming SDK (pip install "hume[stream]") -------------------------
+# ---- Hume streaming SDK (install: pip install "hume[stream]") ----------------
 try:
     from hume.client import AsyncHumeClient
-    from hume.expression_measurement.stream import Config as EMConfig
-    from hume.expression_measurement.stream.socket_client import StreamConnectOptions
+    from hume import StreamDataModels
 except Exception:
     AsyncHumeClient = None
-    EMConfig = None
-    StreamConnectOptions = None
+    StreamDataModels = None
 # -----------------------------------------------------------------------------
 
 PID = os.getpid()
@@ -187,6 +196,10 @@ class RealtimeAgg:
         self.peak_events: List[Tuple[float, str, float]] = []
 
     def ingest(self, result: Dict[str, Any]):
+        """
+        Accepts a single 'result' object returned by socket.send_file(...),
+        which contains models.prosody.predictions[*].time/emotions.
+        """
         try:
             models = (result.get("models") or {})
             prosody = models.get("prosody") or {}
@@ -279,7 +292,7 @@ def build_report_from_agg(agg: RealtimeAgg, title_hint: str = "Vocal Tone Sessio
     )
 
 # =========================
-# Hume streaming session (forward whole 4s chunk)
+# Hume streaming session (forward whole ~4s chunk)
 # =========================
 def _pcm8_to_pcm16(pcm8: bytes) -> bytes:
     import array
@@ -308,11 +321,16 @@ class HumeStreamSession:
         self.agg = RealtimeAgg()
 
     async def start(self):
-        if not (AsyncHumeClient and EMConfig and StreamConnectOptions and HUME_API_KEY):
-            raise RuntimeError("Hume streaming not configured.")
-        self._client = AsyncHumeClient(api_key=HUME_API_KEY)
+        # Guard
+        if not (HUME_API_KEY and AsyncHumeClient and StreamDataModels):
+            raise RuntimeError("Hume streaming not configured (check HUME_API_KEY and hume[stream] install).")
+
+        if self._client is None:
+            self._client = AsyncHumeClient(api_key=HUME_API_KEY)
+
+        # Open a stream socket (prosody model enabled)
         self._socket_cm = self._client.expression_measurement.stream.connect(
-            options=StreamConnectOptions(config=EMConfig(prosody={}), interim_results=True)
+            options={"config": StreamDataModels(prosody={})}
         )
         self._socket = await self._socket_cm.__aenter__()
         self.active = True
@@ -341,17 +359,24 @@ class HumeStreamSession:
         elif codec != "pcm16":
             raise ValueError(f"Unsupported codec={codec}; send pcm16 or pcm8.")
 
-        # Optional: sanity-check inferred duration (defensive)
+        # Optional: duration guard (≤5s/message per Hume streaming spec)
         # dur_sec = len(raw) / (2 * self.sample_rate)
-        # if dur_sec > 5.1: raise ValueError(f"Chunk too long ({dur_sec:.2f}s). Max 5s per message.")
+        # if dur_sec > 5.1:
+        #     raise ValueError(f"Chunk too long ({dur_sec:.2f}s). Max 5s per message.")
 
+        # Write tiny WAV to a temp file and send over the socket
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
         try:
             wav_bytes = _wav_from_pcm16(raw, self.sample_rate)
             tmp.write(wav_bytes); tmp.flush(); tmp.close()
             result = await self._socket.send_file(file=tmp.name)
+            # Some SDKs may return a list of result objects
             if isinstance(result, dict):
                 self.agg.ingest(result)
+            elif isinstance(result, list):
+                for r in result:
+                    if isinstance(r, dict):
+                        self.agg.ingest(r)
         except Exception as e:
             print(f"❌ Hume send_chunk error: {e}")
         finally:
@@ -431,23 +456,35 @@ async def health():
     return {
         "status": "ok",
         "omi_creds_loaded": bool(OMI_APP_ID and OMI_APP_SECRET),
-        "hume_ready": bool(HUME_API_KEY and AsyncHumeClient and EMConfig and StreamConnectOptions),
+        "hume_ready": bool(HUME_API_KEY and AsyncHumeClient and StreamDataModels),
         "llm_ready": bool(DEEPSEEK_API_KEY),
         "pid": PID,
         "mode": "stream_forward_4s",
     }
 
-@app.get("/hume/ping")
-async def hume_ping():
-    if not (HUME_API_KEY and AsyncHumeClient and EMConfig and StreamConnectOptions):
+@app.head("/")
+async def head_root():
+    return Response(status_code=200)
+
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True, "mode": "stream_forward_4s"}
+
+@app.head("/healthz")
+async def head_healthz():
+    return Response(status_code=200)
+
+@app.get("/hume/stream/ping")
+async def hume_stream_ping():
+    if not (HUME_API_KEY and AsyncHumeClient and StreamDataModels):
         return {"ok": False, "error": "Hume streaming not configured"}
     try:
         client = AsyncHumeClient(api_key=HUME_API_KEY)
         async with client.expression_measurement.stream.connect(
-            options=StreamConnectOptions(config=EMConfig(prosody={}))
+            options={"config": StreamDataModels(prosody={})}
         ) as socket:
-            jd = await socket.get_job_details()
-            return {"ok": True, "ping_target": "stream.connect", "job_details": bool(jd)}
+            details = await socket.get_job_details()
+        return {"ok": True, "details": bool(details)}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
