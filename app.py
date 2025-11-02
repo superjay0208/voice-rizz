@@ -352,13 +352,28 @@ class BatchResultProcessor:
         if 'models' not in first_prediction_set or 'prosody' not in first_prediction_set['models']:
             print(f"❌ BatchResultProcessor: 'models' or 'prosody' not in {first_prediction_set.keys()}")
             return
-
+            
         prosody_data = first_prediction_set['models']['prosody']
-        all_preds = prosody_data.get('predictions', [])
-        
+        # Prefer 'predictions' if present; otherwise flatten 'grouped_predictions'
+        all_preds = prosody_data.get('predictions')
+        if not all_preds:
+            gps = prosody_data.get('grouped_predictions', [])
+            flat = []
+            for g in gps:
+                plist = g.get('predictions', [])
+                # carry group id (speaker diarization sometimes goes here)
+                gid = g.get('id') or g.get('speaker') or None
+                for p in plist:
+                    # normalize to the same shape we use elsewhere
+                    p = dict(p)
+                    p['speaker'] = p.get('speaker') or gid
+                    flat.append(p)
+            all_preds = flat
+
         if not all_preds:
             print("BatchResultProcessor: Prosody model ran but found no predictions.")
             return
+
 
         # Find total duration
         self.total_dur = max(float(p.get('time', {}).get('end', 0.0)) for p in all_preds)
@@ -724,49 +739,48 @@ async def llm_ping():
     out = await call_llm(msgs, temperature=0.0, max_tokens=5)
     return {"bridge_ok": out == "ok", "raw": out}
 
+# --- VoiceState ---
+class VoiceState:
+    def __init__(self, uid: str):
+        ...
+        self.codec: str = "pcm16"   # ← new
+
+# --- /audio endpoint ---
 @app.post("/audio")
 async def audio_ingest(
     request: Request,
     uid: Optional[str] = Query(None),
     session_id: Optional[str] = Query(None),
     sample_rate: int = Query(16000),
+    codec: str = Query("pcm16"),  # ← new: 'pcm16' | 'pcm8' | 'opus' | 'opusfs320'
 ):
-    """
-    Omi posts raw audio bytes here.
-    This endpoint now BUFFERS audio and does NOT call Hume.
-    """
-    key = uid or session_id or request.headers.get("X-Session-ID") or request.headers.get("X-Omi-Uid")
-    if not key:
-        return {"status": "ignored", "reason": "missing_uid_or_session_id"}
-
-    st = await _get_state(key)
-    body = await request.body()
-    now = time.time()
-
-    if not body:
-        return {"status": "ignored", "reason": "empty_body"}
-
+    ...
     async with st.lock:
-        # Idle finalize before new chunk (if needed)
-        # FIX: Corrected typo from IDLE_TOKEN_SEC to IDLE_TIMEOUT_SEC
-        if st.active and st.last_wall_ts and (now - st.last_wall_ts > IDLE_TIMEOUT_SEC):
-            print(f"⏰ Idle timeout for uid={key} — auto-finalize")
-            await finalize_and_report(st)
-
         if not st.active:
-            st.active = True
-            st.started_at = now
-            st.audio_buffer = []      # MOD: Reset buffer
-            st.sample_rate = sample_rate  # MOD: Store sample rate
-            print(f"🟢 session starts (uid={key}, sample_rate={sample_rate})")
-
-        st.touch()
-        st.last_audio_ts = now
-        
-        # MOD: Just buffer the audio bytes
+            ...
+            st.sample_rate = sample_rate
+            st.codec = codec.lower()  # ← new
+            print(f"🟢 session starts (uid={key}, sample_rate={sample_rate}, codec={st.codec})")
+        ...
         st.audio_buffer.append(body)
+    return {"status": "ok_buffered", "received": len(body), "sample_rate": sample_rate, "codec": codec}
 
-    return {"status": "ok_buffered", "received": len(body), "sample_rate": sample_rate}
+# --- helper: convert PCM8 → PCM16 (μ-law/ALAW not handled; this is linear 8-bit) ---
+def _pcm8_to_pcm16(pcm8: bytes) -> bytes:
+    import array
+    a = array.array('B', pcm8)                   # unsigned 8-bit
+    # convert to signed 16-bit: center at 0 and scale
+    out = array.array('h', ((x - 128) << 8 for x in a))
+    return out.tobytes()
+
+# --- in finalize_and_report before _bytes_to_wav_path(...) ---
+full_audio_bytes = b"".join(st.audio_buffer)
+if st.codec == "pcm8":                          # ← new
+    full_audio_bytes = _pcm8_to_pcm16(full_audio_bytes)
+elif st.codec in ("opus", "opusfs320"):         # ← new
+    # Easiest: configure Omi sender to PCM16. Otherwise, decode here.
+    print("❌ Received Opus but decoder not enabled; please send PCM16 or add Opus decode.")
+    # return an error or proceed after adding an Opus decoder.
 
 @app.post("/conversation/end")
 async def conversation_end(uid: Optional[str] = Query(None), session_id: Optional[str] = Query(None)):
