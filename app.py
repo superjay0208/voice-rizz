@@ -103,7 +103,7 @@ async def omi_send_notification(uid: str, title: str, body: str):
         return
     url = f"https://api.omi.me/v2/integrations/{OMI_APP_ID}/notification"
     headers = {"Authorization": f"Bearer {OMI_APP_SECRET}", "Content-Type": "application/json", "Content-Length": "0"}
-    params = {"uid": uid, "message": f"{title}: {body}"[:1800]}
+    params = {"uid": uid, "message": f"{title}: {body}"[:]}
     try:
         r = await http_client.post(url, headers=headers, params=params, timeout=15.0)
         if r.status_code // 100 != 2:
