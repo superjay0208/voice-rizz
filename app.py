@@ -46,33 +46,45 @@ DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.co
 IDLE_TIMEOUT_SEC = int(os.environ.get("IDLE_TIMEOUT_SEC", "30"))
 SUPPORTED_CODECS = {"pcm16", "pcm8"}  # Opus not handled here
 
-# ---- Hume streaming SDK (work with multiple SDK variants) --------------------
+# ---- Hume streaming SDK (compatible with both SDK faces) --------------------
 AsyncHumeClient = None
-StreamDataModels = None
-EMConfig = None
+StreamDataModels = None   # "new" style (README)
+EMConfig = None           # "docs" style
 StreamConnectOptions = None
+HUME_API_FACE = None
 
+# Try the top-level imports shown in docs
 try:
-    # Newer SDK pattern from README (v0.13.x)
-    from hume.client import AsyncHumeClient as _Async
-    from hume import StreamDataModels as _SDM
+    from hume import AsyncHumeClient as _Async
+    from hume.expression_measurement.stream import Config as _EMConfig
+    from hume.expression_measurement.stream.socket_client import StreamConnectOptions as _SCO
     AsyncHumeClient = _Async
-    StreamDataModels = _SDM
+    EMConfig = _EMConfig
+    StreamConnectOptions = _SCO
+    HUME_API_FACE = "docs"
 except Exception:
     pass
 
+# Try the README / alt face (StreamDataModels)
 if AsyncHumeClient is None:
     try:
-        # Explicit config objects from docs page
         from hume.client import AsyncHumeClient as _Async
-        from hume.expression_measurement.stream import Config as _EMConfig
-        from hume.expression_measurement.stream.socket_client import StreamConnectOptions as _SCO
+        from hume import StreamDataModels as _SDM
         AsyncHumeClient = _Async
-        EMConfig = _EMConfig
-        StreamConnectOptions = _SCO
+        StreamDataModels = _SDM
+        HUME_API_FACE = "readme"
     except Exception:
         pass
+
+def hume_ready() -> bool:
+    return bool(
+        HUME_API_KEY and AsyncHumeClient and (
+            (HUME_API_FACE == "docs" and EMConfig and StreamConnectOptions) or
+            (HUME_API_FACE == "readme" and StreamDataModels)
+        )
+    )
 # -----------------------------------------------------------------------------
+
 
 
 # =========================
@@ -364,27 +376,25 @@ class HumeStreamSession:
         self.agg = RealtimeAgg()
 
     async def start(self):
-        if not (HUME_API_KEY and AsyncHumeClient):
-            raise RuntimeError("Hume streaming not configured (check HUME_API_KEY and hume install).")
-
+        if not hume_ready():
+            raise RuntimeError("Hume streaming not configured (imports / API face mismatch).")
+    
         if self._client is None:
             self._client = AsyncHumeClient(api_key=HUME_API_KEY)
-
-        # Build connect options (support both SDK faces)
-        if StreamDataModels is not None:
+    
+        if HUME_API_FACE == "readme" and StreamDataModels is not None:
             options = {"config": StreamDataModels(prosody={})}
-            self._socket_cm = self._client.expression_measurement.stream.connect(options=options)
-        elif EMConfig is not None and StreamConnectOptions is not None:
-            cfg = EMConfig(prosody={})
-            options = StreamConnectOptions(config=cfg)
-            self._socket_cm = self._client.expression_measurement.stream.connect(options=options)
+        elif HUME_API_FACE == "docs" and EMConfig is not None and StreamConnectOptions is not None:
+            options = StreamConnectOptions(config=EMConfig(prosody={}))
         else:
             raise RuntimeError("Hume streaming classes unavailable in installed SDK.")
-
+    
+        self._socket_cm = self._client.expression_measurement.stream.connect(options=options)
         self._socket = await self._socket_cm.__aenter__()
         self.active = True
         self.touch()
-        print(f"🟢 Hume stream opened (uid={self.uid}, fs={self.sample_rate}Hz)")
+        print(f"🟢 Hume stream opened (uid={self.uid}, fs={self.sample_rate}Hz, face={HUME_API_FACE})")
+
 
     async def close(self):
         try:
@@ -502,14 +512,43 @@ async def finalize_and_report(st: VoiceState, title_hint="Vocal Tone Session") -
 # =========================
 @app.get("/")
 async def health():
+    hume_version = None
+    try:
+        import hume as _h
+        hume_version = getattr(_h, "__version__", None)
+    except Exception:
+        pass
     return {
         "status": "ok",
         "omi_creds_loaded": bool(OMI_APP_ID and OMI_APP_SECRET),
-        "hume_ready": bool(HUME_API_KEY and AsyncHumeClient and (StreamDataModels or (EMConfig and StreamConnectOptions))),
+        "hume_ready": hume_ready(),
+        "hume_version": hume_version,
         "llm_ready": bool(DEEPSEEK_API_KEY),
         "pid": PID,
         "mode": "stream_forward_4s",
+        "api_face": HUME_API_FACE,
     }
+
+@app.get("/hume/stream/ping")
+async def hume_stream_ping():
+    if not hume_ready():
+        return {"ok": False, "error": "Hume streaming not configured (see /)"}
+    try:
+        client = AsyncHumeClient(api_key=HUME_API_KEY)
+        if HUME_API_FACE == "readme":
+            async with client.expression_measurement.stream.connect(
+                options={"config": StreamDataModels(prosody={})}
+            ) as socket:
+                details = await socket.get_job_details()
+        else:
+            async with client.expression_measurement.stream.connect(
+                options=StreamConnectOptions(config=EMConfig(prosody={}))
+            ) as socket:
+                details = await socket.get_job_details()
+        return {"ok": True, "details": bool(details), "face": HUME_API_FACE}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "face": HUME_API_FACE}
+
 
 @app.head("/")
 async def head_root():
@@ -522,27 +561,6 @@ async def healthz():
 @app.head("/healthz")
 async def head_healthz():
     return Response(status_code=200)
-
-@app.get("/hume/stream/ping")
-async def hume_stream_ping():
-    if not (HUME_API_KEY and AsyncHumeClient and (StreamDataModels or (EMConfig and StreamConnectOptions))):
-        return {"ok": False, "error": "Hume streaming not configured"}
-    try:
-        client = AsyncHumeClient(api_key=HUME_API_KEY)
-        if StreamDataModels:
-            async with client.expression_measurement.stream.connect(
-                options={"config": StreamDataModels(prosody={})}
-            ) as socket:
-                details = await socket.get_job_details()
-        else:
-            cfg = EMConfig(prosody={})
-            async with client.expression_measurement.stream.connect(
-                options=StreamConnectOptions(config=cfg)
-            ) as socket:
-                details = await socket.get_job_details()
-        return {"ok": True, "details": bool(details)}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
 
 @app.get("/llm/ping")
 async def llm_ping():
