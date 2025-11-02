@@ -111,21 +111,27 @@ async def omi_send_notification(uid: str, title: str, body: str):
     except Exception as e:
         print(f"❌ Omi notification error: {e}")
 
-async def omi_save_memory(uid: str, full_text: str):
+async def omi_save_memory(uid: str, summary_text: str):
+    """
+    Save ONLY a short 'overall feedback' summary to Omi memories.
+    The full report is NOT sent here.
+    """
     if not (OMI_APP_ID and OMI_APP_SECRET and http_client):
         return
     try:
-        await omi_create_conversation(uid, full_text)
+        # (Optional) write a tiny conversation entry for traceability — kept concise
+        await omi_create_conversation(uid, summary_text)
+
         url = f"https://api.omi.me/v2/integrations/{OMI_APP_ID}/user/memories"
         headers = {"Authorization": f"Bearer {OMI_APP_SECRET}", "Content-Type": "application/json"}
         params = {"uid": uid}
-        first_line = (full_text.splitlines() or [""])[0][:300]
         payload = {
-            "text": full_text,
+            # Critical: only the short summary is included
+            "text": summary_text,
             "text_source": "other",
-            "text_source_spec": "vocal_tone",
+            "text_source_spec": "vocal_tone_overall_feedback",
             "memories": [
-                {"content": first_line, "tags": ["vocal_tone", "hume", "prosody", "report"]}
+                {"content": summary_text, "tags": ["vocal_tone", "hume", "prosody", "overall_feedback"]}
             ],
         }
         r = await http_client.post(url, headers=headers, params=params, json=payload)
@@ -323,6 +329,26 @@ def build_report(agg: BatchResultProcessor, title_hint: str = "Vocal Tone Sessio
         f'*Report derived from vocal expressions only; labels reflect perceived vocal tone, not inner feelings.*'
     )
 
+# ===== NEW: build a short overall-feedback line (used ONLY for memory) =====
+def build_overall_feedback(metrics: Dict[str, int], title_hint: str = "Vocal Tone Session") -> str:
+    # Plain, compact, and deterministic (no LLM content)
+    tone_desc = "warm" if metrics["warmth"] >= 60 else ("tense" if metrics["tension"] >= 55 else "neutral")
+    if metrics["tension"] >= 55:
+        tip = "slow down & add brief pauses"
+    elif metrics["energy"] < 45:
+        tip = "add pitch/energy variation"
+    elif metrics["engage"] < 50:
+        tip = "invite engagement with questions"
+    else:
+        tip = "keep current delivery; minor refinements only"
+
+    return (
+        f'{title_hint} — Overall feedback: tone {tone_desc}. '
+        f'Scores: Tone {metrics["vocal_tone"]}, Warmth {metrics["warmth"]}, '
+        f'Tension {metrics["tension"]}, Energy {metrics["energy"]}, Engage {metrics["engage"]} '
+        f'(AI conf {metrics["ai_conf"]}). Tip: {tip}.'
+    )
+
 # =========================
 # Per-UID session state
 # =========================
@@ -458,29 +484,48 @@ async def finalize_and_report(st: VoiceState, title_hint="Vocal Tone Session") -
 
     batch_result_json = await hume_measure_batch(full_audio_bytes, sample_rate)
 
+    report_text: str
+    metrics_for_summary: Dict[str, int] = {
+        "warmth": 0, "tension": 0, "energy": 0, "engage": 0,
+        "vocal_conf": 0, "vocal_tone": 0, "ai_conf": 0
+    }
+
     if not batch_result_json:
         print(f"❌ Hume Batch job failed or returned empty for uid={uid}.")
         report_text = f'Vocal Tone: -- — "{title_hint}"\nAI Confidence: 0\n\nFailed to process audio with Hume Batch API.'
+        overall_feedback = f'{title_hint} — Overall feedback: processing failed; no metrics available.'
     else:
         processor = BatchResultProcessor(batch_result_json)
-        report_text: Optional[str] = None
+        metrics_for_summary = compute_metrics(processor)
+
+        # Try LLM; fallback to deterministic text
+        report_text_opt: Optional[str] = None
         try:
             hume_json_for_llm = processor.compressed_json(topk_per_pred=5, min_score=0.15, max_preds=600)
             sys_prompt = HUME_ANALYSIS_SYSTEM_PROMPT
             user_prompt = build_hume_user_prompt(hume_json_for_llm, title_hint=title_hint)
             messages = [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_prompt}]
-            report_text = await call_llm(messages, temperature=0.2, max_tokens=1400)
+            report_text_opt = await call_llm(messages, temperature=0.2, max_tokens=1400)
         except Exception as e:
             print(f"❌ LLM pipeline error: {e}")
-        if not report_text:
-            report_text = build_report(processor, title_hint=title_hint)
 
+        if not report_text_opt:
+            report_text = build_report(processor, title_hint=title_hint)
+        else:
+            report_text = report_text_opt
+
+        # NEW: summary for memory (no LLM text included)
+        overall_feedback = build_overall_feedback(metrics_for_summary, title_hint=title_hint)
+
+    # Notify & conversation still use the full report
     await omi_send_notification(uid, title="Your Vocal Tone Report", body=report_text[:800])
     await omi_create_conversation(uid, report_text)
-    await omi_save_memory(uid, report_text)
+
+    # Memory ONLY gets the short overall feedback (no full report stored)
+    await omi_save_memory(uid, overall_feedback)
 
     st.active = False; st.started_at = 0.0; st.touch()
-    return {"status": "success", "summary": {"report": report_text}}
+    return {"status": "success", "summary": {"report": report_text, "overall_feedback": overall_feedback}}
 
 # =========================
 # Endpoints
