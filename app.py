@@ -7,8 +7,7 @@
 #
 # ENV:
 #   OMI_APP_ID         = <your Omi integration id>
-#   OMI_APP_SECRET     = <your Omi app secret>     (for /notification)
-#   OMI_API_KEY        = <your Omi API key>        (for Imports: conversations/memories)
+#   OMI_APP_SECRET     = <your Omi app secret>     (for /notification)  <your Omi API key>        (for Imports: conversations/memories)
 #   HUME_API_KEY       = <your Hume API key>
 #   DEEPSEEK_API_KEY   = <your LLM key>            (DeepSeek or drop-in compatible chat API)
 #   DEEPSEEK_MODEL     = deepseek-reasoner         (default)
